@@ -1,0 +1,85 @@
+name: Deploy Backstage
+
+on:
+  push:
+    branches: main
+
+concurrency: ${{ github.ref }}
+
+env:
+  AWS_ECR: ${{ secrets.AWS_ECR }}
+  IMAGE: backstage
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  SCORE_HUMANITEC_VERSION: '0.7.0'
+
+jobs:
+  deploy:
+    name: Build & Notify Humanitec
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      DOCKER_BUILDKIT: "1"
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure correct org
+        run: find . -type f -name "*.yaml" -exec sed -i 's/htc-demo-REPLACE/${{ github.repository_owner }}/g' {} +
+        if: ${{ github.repository_owner != 'humanitec' }}
+
+      - uses: stefanzweifel/git-auto-commit-action@v4
+        if: ${{ github.repository_owner != 'humanitec' }}
+        with:
+          file_pattern: 'catalog-info.yaml templates/*.yaml'
+
+      - name: Set Tag with SHA
+        run: echo "TAG=`echo $GITHUB_SHA | cut -c 1-7`" >> $GITHUB_ENV
+
+      - run: mkdir credentials && touch credentials/github-app-backstage-humanitec-credentials.yaml
+      - run: docker image build -t backstage .
+
+      - name: Login to AWS ECR
+        if: ${{ github.repository_owner != 'humanitec' }}
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login \
+                --username AWS \
+                --password-stdin \
+                $AWS_ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Push backstage image
+        if: ${{ github.repository_owner != 'humanitec' }}
+        run: |
+          docker tag backstage $AWS_ECR/$IMAGE:$TAG
+          docker push $AWS_ECR/$IMAGE:$TAG
+
+      - name: Inform Humanitec
+        if: ${{ github.repository_owner != 'humanitec' }}
+        run: |-
+          curl \
+            --request POST 'https://api.humanitec.io/orgs/${{ secrets.HUMANITEC_ORG_ID }}/artefact-versions' \
+            --header 'Authorization: Bearer ${{ secrets.HUMANITEC_TOKEN }}' \
+            --header 'Content-Type: application/json' \
+            --data-raw '{
+                "name": "'$AWS_ECR/$IMAGE'",
+                "version": "'$TAG'",
+                "type": "container",
+                "commit": "'$GITHUB_SHA'",
+                "ref": "'$GITHUB_REF'"
+            }'
+
+      - uses: score-spec/setup-score@v2
+        if: ${{ github.repository_owner != 'humanitec' }}
+        with:
+          file: score-humanitec
+          version: ${{ env.SCORE_HUMANITEC_VERSION }}
+
+      - name: Run Score
+        if: ${{ github.repository_owner != 'humanitec' }}
+        run: score-humanitec delta --retry --deploy --token ${{ secrets.HUMANITEC_TOKEN }} --org ${{ secrets.HUMANITEC_ORG_ID }} --app backstage --env development -f score.yaml --extensions humanitec.score.yaml  --property containers.backstage.image=$AWS_ECR/$IMAGE:$TAG
